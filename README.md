@@ -42,6 +42,11 @@
   `dependency_graph` 与本地变更包名列表，先沿反向依赖边传播得到全部受影响包，
   再把环依赖压缩为必须同批构建的组，按“依赖先于依赖者”输出可并行的 stages；
   每个受影响包还给出距最近 changed 包的最短反向路径，未安装的 changed 项单列。
+- **依赖图关键节点审计**：`POST /audit/dependency-chokepoints` 接收 `/resolve`
+  成功响应中的 `resolved` 与 `dependency_graph`，以 `<root>` 为入口，在允许环与
+  菱形结构的有向图上找出每个可达包的**必经依赖**（支配者，任一路径都无法绕过）；
+  再按每个必经包汇总其**独占支配**的下游包（支配树后代）及数量，结果稳定排序，
+  `<root>` 不可达的包单列。
 
 ## 一条命令启动
 
@@ -57,6 +62,7 @@ docker compose up --build
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
+- `POST /audit/dependency-chokepoints` — 审计依赖图的必经依赖（支配者/关键节点）
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
@@ -216,6 +222,87 @@ curl -s -X POST localhost:8000/audit/vulnerabilities \
   人工核查。
 - 版本匹配与求解器口径一致：按 PEP 440 说明符判定，已解析的预发布版本同样参与
   匹配。
+
+## 依赖图关键节点审计 API
+
+`POST /audit/dependency-chokepoints` 接收 `/resolve` **成功响应**中的 `resolved`
+与 `dependency_graph`，以 `<root>` 为入口，在**允许环和菱形结构**的有向图上
+找出每个可达包的必经依赖（支配者），并按每个必经包汇总其独占支配的下游包：
+
+- 若从 `<root>` 到包 `v` 的**每一条**路径都经过包 `d`（任一路径都无法绕过），
+  则 `d` 是 `v` 的**必经依赖**（dominator）。菱形依赖的两个分支因此不互为必经
+  节点；而唯一入口包会支配其后方的整个依赖簇。
+- 对每个必经包 `d`，汇总其**独占支配**的下游包：在支配树中以 `d` 为根的后代
+  集合——即离开 `<root>` 后不经过 `d` 就完全无法到达的包（不含 `d` 自身）。
+- 图允许含环（含自环）：支配关系用迭代数据流不动点算法在一般有向图上计算，
+  天然正确处理强连通分量。
+- 出现在 `resolved` 中但无法从 `<root>` 到达的包（包括只被不可达包引用的包）
+  不参与计算，单列为 `unreachable`。
+
+```bash
+curl -s -X POST localhost:8000/audit/dependency-chokepoints \
+  -H 'Content-Type: application/json' -d '{
+  "resolved": {"app": "1.0", "db": "1.0", "web": "2.0", "common": "1.5"},
+  "dependency_graph": [
+    {"source": "<root>", "source_version": "", "target": "app", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "db", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "web", "target_version": "2.0"},
+    {"source": "db", "source_version": "1.0", "target": "common", "target_version": "1.5"},
+    {"source": "web", "source_version": "2.0", "target": "common", "target_version": "1.5"}
+  ]
+}'
+```
+
+请求字段：
+
+- `resolved`：包名 → 已解析版本（PEP 440），即 `/resolve` 的 `resolved`。
+- `dependency_graph`：边列表，即 `/resolve` 的 `dependency_graph`；校验口径与
+  漏洞审计完全一致（无悬空边、版本必须与 `resolved` 一致、`<root>` 边的
+  `source_version` 必须为空）。
+
+响应（200，以上述菱形为例）：
+
+```json
+{
+  "status": "ok",
+  "summary": {"packages": 4, "reachable": 4, "unreachable": 0, "chokepoints": 1},
+  "packages": [
+    {"package": "app", "version": "1.0", "required_dependencies": []},
+    {"package": "common", "version": "1.5", "required_dependencies": ["app"]},
+    {"package": "db", "version": "1.0", "required_dependencies": ["app"]},
+    {"package": "web", "version": "2.0", "required_dependencies": ["app"]}
+  ],
+  "chokepoints": [
+    {
+      "package": "app",
+      "version": "1.0",
+      "exclusive_count": 3,
+      "exclusive_dominees": ["common", "db", "web"]
+    }
+  ],
+  "unreachable": []
+}
+```
+
+- `packages`：每个从 `<root>` 可达的包一项（按包名排序），`required_dependencies`
+  为其全部必经依赖（不含自身与 `<root>`，按包名排序）。上例中 `db` 与 `web`
+  都能到达 `common`，所以 `common` 可以绕过其中任意一个，二者都不是必经依赖。
+- `chokepoints`：至少独占支配一个下游包的必经包，按 `exclusive_count` **降序**、
+  包名升序稳定排序；`exclusive_dominees` 为其支配树后代（不含自身，按包名排序），
+  `exclusive_count` 为其数量。
+- `unreachable`：已解析但 `<root>` 不可达的包（带版本，按包名排序），单列以便
+  人工核查；空图或空输入时全部（或无）包归入此项，`packages` 与 `chokepoints`
+  为空。
+- 相同输入（即使边的给出顺序不同或含重复边）永远得到相同输出。
+
+校验规则（违反即返回 `400`，错误体与 `/resolve` 相同）：
+
+- `resolved` 中的版本必须是合法 PEP 440 版本，包名规范化后不得重复，`<root>`
+  为保留名（与漏洞审计共用同一套校验）；
+- 边的 `source`（`<root>` 除外）与 `target` 必须出现在 `resolved` 中，否则
+  视为悬空边；
+- 边的 `source_version` / `target_version` 必须与 `resolved` 中对应版本一致
+  （`<root>` 边的 `source_version` 必须为空）。
 
 ## 许可证审计 API
 
@@ -549,11 +636,12 @@ app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
+  chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
   main.py           # FastAPI 应用与 /resolve、/audit/*、/plan/rebuild、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、许可证审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

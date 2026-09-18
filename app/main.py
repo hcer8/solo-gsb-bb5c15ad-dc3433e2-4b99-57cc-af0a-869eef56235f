@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import run_audit
+from .chokepoint_audit import run_dependency_chokepoints
 from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
@@ -103,6 +104,18 @@ class AuditRequest(BaseModel):
     )
 
 
+class DependencyChokepointsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    dependency_graph: list[GraphEdgeInput] = Field(
+        default_factory=list,
+        description="Edges as returned by /resolve.",
+    )
+
+
 class RebuildPlanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -173,7 +186,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -287,6 +300,27 @@ async def audit_vulnerabilities_endpoint(payload: AuditRequest) -> JSONResponse:
     ``<root>`` -> package paths; unreachable hits are listed as ``orphaned``.
     """
     body = run_audit(payload.resolved, payload.dependency_graph, payload.advisories)
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/audit/dependency-chokepoints")
+async def dependency_chokepoints_endpoint(
+    payload: DependencyChokepointsRequest,
+) -> JSONResponse:
+    """Find mandatory (unavoidable) dependencies in a resolved graph.
+
+    Takes the ``resolved`` mapping and ``dependency_graph`` edges from a
+    successful ``/resolve`` response.  Starting at ``<root>``, a package is a
+    mandatory dependency of another when every root-to-package path passes
+    through it (no path can bypass it); diamonds therefore do not gate their
+    shared target, and cycles are supported.  Each chokepoint also reports the
+    packages it exclusively dominates (its dominator-tree descendants) and
+    their count.  Results are stably sorted; packages that are resolved but
+    unreachable from ``<root>`` are listed separately.
+    """
+    body = run_dependency_chokepoints(
+        payload.resolved, payload.dependency_graph
+    )
     return JSONResponse(status_code=200, content=body)
 
 
