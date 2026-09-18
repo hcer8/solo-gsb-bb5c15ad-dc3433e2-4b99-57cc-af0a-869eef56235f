@@ -38,6 +38,10 @@
   [`license-expression`](https://github.com/aboutcode-org/license-expression)
   库解析，支持括号、`AND`、`OR`、`WITH`（`WITH` 按 `AND` 分别判定许可证与例外）；
   响应给出规范化表达式与决定状态的标识符，任一表达式非法即整体返回 400。
+- **依赖关键节点审计**：`POST /audit/dependency-chokepoints` 接收 `/resolve`
+  成功响应中的 `resolved` 与 `dependency_graph`，以 `<root>` 为唯一入口做
+  支配性分析：对每个可达包找出任一路径都无法绕过的必经依赖（允许环与菱形
+  结构），并按每个必经包汇总其独占支配的下游包及数量；根不可达包单列。
 - **重建计划**：`POST /plan/rebuild` 接收 `/resolve` 成功响应中的 `resolved`、
   `dependency_graph` 与本地变更包名列表，先沿反向依赖边传播得到全部受影响包，
   再把环依赖压缩为必须同批构建的组，按“依赖先于依赖者”输出可并行的 stages；
@@ -57,6 +61,7 @@ docker compose up --build
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
+- `POST /audit/dependency-chokepoints` — 找出已解析依赖图中的关键节点（必经依赖）
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
@@ -294,6 +299,71 @@ curl -s -X POST localhost:8000/audit/licenses \
   全部非法表达式会在一次 400 中合并报告；
 - `allowed` / `denied` 的每一项必须是单个 SPDX 标识符；
 - 包名规范化后不得重复，`<root>` 为保留名。
+
+## 依赖关键节点审计 API
+
+`POST /audit/dependency-chokepoints` 接收 `/resolve` **成功响应**中的
+`resolved` 与 `dependency_graph`，以 `<root>` 为唯一入口做**支配性分析**
+（dominator analysis）：当从 `<root>` 到包 `p` 的*每一条*路径都经过包 `c`
+时，`c` 支配 `p`——即使图中存在环或菱形汇合，`p` 也无法绕过 `c` 被到达。
+`c` 就是 `p` 的**必经依赖**（关键节点）。响应按每个必经包汇总其独占支配的
+下游包及数量——这正是移除或攻陷该包的影响面：
+
+```bash
+curl -s -X POST localhost:8000/audit/dependency-chokepoints \
+  -H 'Content-Type: application/json' -d '{
+  "resolved": {"app": "1.0", "left": "1.0", "right": "1.0", "shared": "1.5"},
+  "dependency_graph": [
+    {"source": "<root>", "source_version": "", "target": "app", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "left", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "right", "target_version": "1.0"},
+    {"source": "left", "source_version": "1.0", "target": "shared", "target_version": "1.5"},
+    {"source": "right", "source_version": "1.0", "target": "shared", "target_version": "1.5"}
+  ]
+}'
+```
+
+请求字段：
+
+- `resolved`：包名 → 已解析版本（PEP 440），即 `/resolve` 的 `resolved`。
+- `dependency_graph`：边列表，即 `/resolve` 的 `dependency_graph`；校验口径与
+  漏洞审计、重建计划完全一致（无悬空边、版本必须与 `resolved` 一致、`<root>`
+  边的 `source_version` 必须为空）。
+
+响应（200）：
+
+```json
+{
+  "status": "ok",
+  "summary": {"packages": 4, "reachable": 4, "unreachable": 0, "chokepoints": 1},
+  "chokepoints": [
+    {
+      "package": "app",
+      "version": "1.0",
+      "dominated": ["left", "right", "shared"],
+      "dominated_count": 3
+    }
+  ],
+  "unreachable": []
+}
+```
+
+- `chokepoints`：每个必经包一项，含其已解析版本、独占支配的下游包清单
+  `dominated` 及数量 `dominated_count`。上例中菱形结构在 `shared` 处汇合，
+  因此 `left` / `right` 都可被绕过，唯一的关键节点是 `app`。清单按包名稳定
+  排序，`dominated` 同样按名称排序，相同输入（即使边的给出顺序不同）永远
+  得到相同输出。
+- `unreachable`：出现在 `resolved` 中但无法从 `<root>` 到达的包，单列以便
+  人工核查；它们不参与支配性分析，也不会出现在任何 `dominated` 中。
+- 支配关系在含环图上由标准迭代数据流方程求出（`dom(n) = {n} ∪ ⋂ dom(前驱)`，
+  交汇算子为集合交集），环与自环无需特殊处理且不动点唯一。`<root>` 与包
+  自身不算依赖，二者都从必经依赖中排除。
+
+校验规则（违反即返回 `400`，错误体与 `/resolve` 相同，且不产生任何部分结果）：
+与漏洞审计完全一致——`resolved` 中的版本必须是合法 PEP 440 版本；边的
+`source`（`<root>` 除外）与 `target` 必须出现在 `resolved` 中，否则视为悬空
+边；边的 `source_version` / `target_version` 必须与 `resolved` 中对应版本一致
+（`<root>` 边的 `source_version` 必须为空）。
 
 ## 重建计划 API
 
@@ -550,10 +620,11 @@ app/
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
+  chokepoints.py    # 关键节点审计：<root> 支配性分析（必经依赖）、按必经包汇总下游影响面
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
   main.py           # FastAPI 应用与 /resolve、/audit/*、/plan/rebuild、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、许可证审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+tests/              # 端到端 API 测试（含漏洞、许可证、关键节点审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

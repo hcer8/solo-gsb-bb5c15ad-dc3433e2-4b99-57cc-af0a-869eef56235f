@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import run_audit
+from .chokepoints import run_chokepoint_audit
 from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
@@ -120,6 +121,18 @@ class RebuildPlanRequest(BaseModel):
             "reported as 'uninstalled'; the rest seed reverse-dependency "
             "propagation."
         ),
+    )
+
+
+class ChokepointAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    dependency_graph: list[GraphEdgeInput] = Field(
+        default_factory=list,
+        description="Edges as returned by /resolve.",
     )
 
 
@@ -304,6 +317,24 @@ async def audit_licenses_endpoint(payload: LicenseAuditRequest) -> JSONResponse:
     body = run_license_audit(
         payload.resolved, payload.licenses, payload.allowed, payload.denied
     )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/audit/dependency-chokepoints")
+async def audit_dependency_chokepoints_endpoint(
+    payload: ChokepointAuditRequest,
+) -> JSONResponse:
+    """Find the chokepoint dependencies of a resolved dependency graph.
+
+    Takes the ``resolved`` mapping and ``dependency_graph`` edges from a
+    successful ``/resolve`` response and runs a dominator analysis with
+    ``<root>`` as the entry: a package dominates another when every path
+    from ``<root>`` to it passes through the dominator — cycles and diamond
+    re-convergence cannot bypass it.  Each chokepoint reports the downstream
+    packages it exclusively controls plus their count; resolved packages
+    unreachable from ``<root>`` are listed separately as ``unreachable``.
+    """
+    body = run_chokepoint_audit(payload.resolved, payload.dependency_graph)
     return JSONResponse(status_code=200, content=body)
 
 
